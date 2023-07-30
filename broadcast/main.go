@@ -1,59 +1,66 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
-	"sort"
 
 	mapset "github.com/deckarep/golang-set/v2"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+// n is current node
 var n *maelstrom.Node
-var messages mapset.Set[int]
-var neighbours_seen map[string]mapset.Set[int]
-var neighbours []string
 
-// propagate_to_other_nodes sends the recieved new message to all other nodes.
+// messages are the recieved messages so far
+var messages mapset.Set[int]
+
+// neighbours_seen maps each neighbour to its acknowledged messages
+var neighbours_seen map[string]mapset.Set[int]
+
+// propagate_to_other_nodes sends the messages that neighbours have not send the
+// recieved_ack message back.
 func propagate_to_other_nodes() error {
 	response := make(map[string]any)
 	response["type"] = "node_propagate"
 
 	for node, n_seen := range neighbours_seen {
+		ctx := context.Background()
 		new_messages := messages.Difference(n_seen).ToSlice()
 
 		if len(new_messages) == 0 {
 			continue
 		}
 		response["message"] = new_messages
-		log.Println(n.ID(), " sending to ", node, " msg: ", new_messages)
+		log.Println(n.ID(), "sending to", node, "msg:", new_messages)
 
-		if err := n.RPC(node, response, func(msg maelstrom.Message) error {
-			var body map[string]any
-			if err := json.Unmarshal(msg.Body, &body); err != nil {
-				return err
+		msg, err := n.SyncRPC(ctx, node, response)
+		if err != nil {
+			log.Println("Error on sending", new_messages, "to", node, err)
+			continue
+		}
+
+		var body map[string]any
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+		if body["type"] == "node_propagate_ok" {
+			received_messages := body["received_messages"].([]interface{})
+			received_messages_int := make([]int, len(received_messages))
+			for i, v := range received_messages {
+				received_messages_int[i] = int(v.(float64))
 			}
-			log.Printf("%s Send to %s successfully\n", n.ID(), msg.Src)
-			if body["type"] == "node_propagate_ok" {
-				// neighbours_seen[node].Append(new_messages...)
-				received_messages := body["received_messages"].([]interface{})
-				received_messages_int := make([]int, len(received_messages))
-				for i, v := range received_messages {
-					received_messages_int[i] = int(v.(float64))
-				}
-				log.Println(node, " replied ok for", received_messages_int, "total message", body)
-				neighbours_seen[node].Append(received_messages_int...)
-			}
-			return nil
-		}); err != nil {
-			log.Println("fuck error!")
+
+			neighbours_seen[node].Append(received_messages_int...)
+			log.Println(node, "replied ok for", received_messages_int, "total message", body)
 		}
 	}
 
 	return nil
 }
 
-// node_propagate_handler adds the recieved message to the list of recieved messages.
+// node_propagate_handler adds the recieved message to the list of recieved messages and also propagates it to
+// other nodes.
 func node_propagate_handler(msg maelstrom.Message) error {
 	// Unmarshal the message body as an loosely-typed map.
 	var body map[string]any
@@ -66,8 +73,9 @@ func node_propagate_handler(msg maelstrom.Message) error {
 	for i, v := range new_messages {
 		new_messages_int[i] = int(v.(float64))
 	}
-	log.Println(n.ID(), "got", new_messages_int)
+	log.Println(n.ID(), "recieved:", new_messages_int)
 
+	// propagate to other nodes if the recieved message is new
 	if n := messages.Append(new_messages_int...); n > 0 {
 		propagate_to_other_nodes()
 	}
@@ -75,7 +83,7 @@ func node_propagate_handler(msg maelstrom.Message) error {
 	response := make(map[string]any)
 	response["type"] = "node_propagate_ok"
 	response["received_messages"] = new_messages_int
-	log.Println(n.ID(), "replying is", response)
+
 	return n.Reply(msg, response)
 }
 
@@ -110,12 +118,11 @@ func read_handler(msg maelstrom.Message) error {
 
 	body["type"] = "read_ok"
 	body["messages"] = messages.ToSlice()
-	sort.Ints(body["messages"].([]int))
 
 	return n.Reply(msg, body)
 }
 
-// topology_handler
+// topology_handler add the neighbour nodes to neighbours_seen map
 func topology_handler(msg maelstrom.Message) error {
 	var body map[string]any
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -125,10 +132,8 @@ func topology_handler(msg maelstrom.Message) error {
 	topology := body["topology"].(map[string]interface{})
 	neighbours_array := topology[n.ID()].([]interface{})
 
-	neighbours = make([]string, len(neighbours_array))
-	for i, nei := range neighbours_array {
+	for _, nei := range neighbours_array {
 		neighbour := nei.(string)
-		neighbours[i] = neighbour
 		neighbours_seen[neighbour] = mapset.NewSet[int]()
 	}
 
@@ -141,7 +146,6 @@ func topology_handler(msg maelstrom.Message) error {
 func main() {
 	messages = mapset.NewSet[int]()
 	neighbours_seen = make(map[string]mapset.Set[int])
-
 	n = maelstrom.NewNode()
 
 	n.Handle("broadcast", broadcast_handler)
