@@ -3,44 +3,50 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sort"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-var messages []int
 var n *maelstrom.Node
+var messages mapset.Set[int]
+var neighbours_seen map[string]mapset.Set[int]
+var neighbours []string
 
 // propagate_to_other_nodes sends the recieved new message to all other nodes.
-func propagate_to_other_nodes(new_id int) error {
+func propagate_to_other_nodes() error {
 	response := make(map[string]any)
 	response["type"] = "node_propagate"
-	response["message"] = new_id
 
-	log.Println("Node ", n.ID(), " Neighbours: ", n.NodeIDs())
-	// for _, node := range n.NodeIDs() {
-	// 	if node != n.ID() {
-	// 		if err := n.Send(node, response); err != nil {
-	// 			return err
-	// 		}
-	// 	}
-	// }
+	for node, n_seen := range neighbours_seen {
+		new_messages := messages.Difference(n_seen).ToSlice()
 
-	for _, node := range n.NodeIDs() {
-		log.Println("Node ", n.ID(), " Sending to ", node, " Message", new_id)
-		if node != n.ID() {
-			if err := n.RPC(node, response, func(msg maelstrom.Message) error {
-				var body map[string]any
-				if err := json.Unmarshal(msg.Body, &body); err != nil {
-					return err
-				}
-				log.Printf("%s Send to %s successfully\n", n.ID(), msg.Src)
-				if body["type"] != "node_propagate_ok" {
-					log.Println("fuck error 2!")
-				}
-				return nil
-			}); err != nil {
-				log.Println("fuck error!")
+		if len(new_messages) == 0 {
+			continue
+		}
+		response["message"] = new_messages
+		log.Println(n.ID(), " sending to ", node, " msg: ", new_messages)
+
+		if err := n.RPC(node, response, func(msg maelstrom.Message) error {
+			var body map[string]any
+			if err := json.Unmarshal(msg.Body, &body); err != nil {
+				return err
 			}
+			log.Printf("%s Send to %s successfully\n", n.ID(), msg.Src)
+			if body["type"] == "node_propagate_ok" {
+				// neighbours_seen[node].Append(new_messages...)
+				received_messages := body["received_messages"].([]interface{})
+				received_messages_int := make([]int, len(received_messages))
+				for i, v := range received_messages {
+					received_messages_int[i] = int(v.(float64))
+				}
+				log.Println(node, " replied ok for", received_messages_int, "total message", body)
+				neighbours_seen[node].Append(received_messages_int...)
+			}
+			return nil
+		}); err != nil {
+			log.Println("fuck error!")
 		}
 	}
 
@@ -55,21 +61,21 @@ func node_propagate_handler(msg maelstrom.Message) error {
 		return err
 	}
 
-	new_id := int(body["message"].(float64))
+	new_messages := body["message"].([]interface{})
+	new_messages_int := make([]int, len(new_messages))
+	for i, v := range new_messages {
+		new_messages_int[i] = int(v.(float64))
+	}
+	log.Println(n.ID(), "got", new_messages_int)
+
+	if n := messages.Append(new_messages_int...); n > 0 {
+		propagate_to_other_nodes()
+	}
 
 	response := make(map[string]any)
 	response["type"] = "node_propagate_ok"
-
-	// If it has new_id already, return. Otherwise also share it with others
-	for _, m := range messages {
-		if m == new_id {
-			return n.Reply(msg, response)
-		}
-	}
-
-	messages = append(messages, new_id)
-	propagate_to_other_nodes(new_id)
-
+	response["received_messages"] = new_messages_int
+	log.Println(n.ID(), "replying is", response)
 	return n.Reply(msg, response)
 }
 
@@ -83,9 +89,9 @@ func broadcast_handler(msg maelstrom.Message) error {
 	}
 
 	new_id := int(body["message"].(float64))
-	messages = append(messages, new_id)
+	messages.Add(new_id)
 
-	if err := propagate_to_other_nodes(new_id); err != nil {
+	if err := propagate_to_other_nodes(); err != nil {
 		return err
 	}
 
@@ -103,7 +109,8 @@ func read_handler(msg maelstrom.Message) error {
 	}
 
 	body["type"] = "read_ok"
-	body["messages"] = messages
+	body["messages"] = messages.ToSlice()
+	sort.Ints(body["messages"].([]int))
 
 	return n.Reply(msg, body)
 }
@@ -116,20 +123,14 @@ func topology_handler(msg maelstrom.Message) error {
 	}
 
 	topology := body["topology"].(map[string]interface{})
-	neighbours := topology[n.ID()].([]interface{})
+	neighbours_array := topology[n.ID()].([]interface{})
 
-	neighbours_list := make([]string, len(neighbours))
-	for i, nei := range neighbours {
-		neighbours_list[i] = nei.(string)
-		// neighbours_list = append(neighbours_list, nei.(string))
+	neighbours = make([]string, len(neighbours_array))
+	for i, nei := range neighbours_array {
+		neighbour := nei.(string)
+		neighbours[i] = neighbour
+		neighbours_seen[neighbour] = mapset.NewSet[int]()
 	}
-
-	// neighbours := make([]string, len(topology[n.ID()]))
-	// for _, neighbour := range topology[n.ID()] {
-	// 	neighbours = append(neighbours, neighbour.(string))
-	// }
-	// log.Panicln("neighboursss ", neighbours)
-	n.Init(n.ID(), neighbours_list)
 
 	response := make(map[string]any)
 	response["type"] = "topology_ok"
@@ -138,6 +139,9 @@ func topology_handler(msg maelstrom.Message) error {
 }
 
 func main() {
+	messages = mapset.NewSet[int]()
+	neighbours_seen = make(map[string]mapset.Set[int])
+
 	n = maelstrom.NewNode()
 
 	n.Handle("broadcast", broadcast_handler)
