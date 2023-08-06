@@ -18,8 +18,6 @@ var kv *maelstrom.KV
 var m sync.Mutex
 var visited_messages map[int]bool
 
-var value int
-
 // add_handler adds the new recieved value to the current state if
 // that massage id is not already seen.
 func add_handler(msg maelstrom.Message) error {
@@ -40,8 +38,9 @@ func add_handler(msg maelstrom.Message) error {
 		return n.Reply(msg, response)
 	}
 
-	// TODO: Use that kv store
+	value := get_state()
 	value += delta
+	update_state(value)
 	visited_messages[msg_id] = true
 	m.Unlock()
 
@@ -54,7 +53,7 @@ func add_handler(msg maelstrom.Message) error {
 func read_handler(msg maelstrom.Message) error {
 	response := make(map[string]any)
 	response["type"] = "read_ok"
-	response["value"] = value
+	response["value"] = get_state()
 
 	return n.Reply(msg, response)
 }
@@ -98,6 +97,56 @@ func broadcast_message(delta int, msg_id int) error {
 	}
 
 	return nil
+}
+
+// get_state returns the current value saved in the state store. It will return 0 if state store is empty and initialize it.
+// in case of time out, it tries to reach the state store again.
+func get_state() int {
+	for {
+		ctx, cancelFunc := context.WithTimeout(context.Background(), time.Second*2)
+		defer cancelFunc()
+
+		value, err := kv.ReadInt(ctx, "state")
+
+		if err != nil {
+			if rpcError, ok := err.(*maelstrom.RPCError); ok && rpcError.Code == maelstrom.KeyDoesNotExist {
+				log.Println("Initializing state with 0")
+				update_state(0)
+				return 0
+			}
+
+			// if context deadline exceeded, try reaching state store again
+			// it can happen because of network partition
+			if errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+
+			log.Panicln("Read State failed:", err)
+		}
+		return value
+	}
+}
+
+// update_state saves the new value in the state store.
+// in case of time out, it tries to reach the state store again.
+func update_state(value int) {
+	for {
+		ctx, cancelFunc := context.WithTimeout(context.Background(), time.Second*2)
+		defer cancelFunc()
+
+		err := kv.Write(ctx, "state", value)
+		if err == nil {
+			break
+		}
+
+		// if context deadline exceeded, try reaching state store again
+		// it can happen because of network partition
+		if errors.Is(err, context.DeadlineExceeded) {
+			continue
+		}
+
+		log.Panicln("Update State failed:", err)
+	}
 }
 
 func main() {
